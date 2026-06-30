@@ -63,22 +63,26 @@ _webhook_lock = threading.Lock()
 # ======================================================================
 # TELEGRAM API HELPERS WITH RETRY
 # ======================================================================
-# Create a session with retry strategy for Telegram API
+# Create a session with aggressive retry strategy for Telegram API (HF Spaces network issues)
 _telegram_session = requests.Session()
 _retry_strategy = Retry(
-    total=3,
-    backoff_factor=1,
+    total=10,
+    connect=5,
+    read=10,
+    backoff_factor=3,
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],
     raise_on_status=False,
+    # Also retry on these exception types
+    retry_mode=None,
 )
 _adapter = HTTPAdapter(max_retries=_retry_strategy, pool_connections=20, pool_maxsize=20)
 _telegram_session.mount("https://", _adapter)
 _telegram_session.mount("http://", _adapter)
 
 def _telegram_request(method: str, endpoint: str, **kwargs):
-    """Make Telegram API request with retry and 90s timeout"""
-    timeout = kwargs.pop('timeout', 90)
+    """Make Telegram API request with retry and 300s timeout"""
+    timeout = kwargs.pop('timeout', 300)
     url = f"{TELEGRAM_API}/{endpoint}"
     try:
         return _telegram_session.request(method, url, timeout=timeout, **kwargs)
@@ -674,8 +678,13 @@ def setup_webhook():
     
     def _do_setup():
         try:
-            _telegram_request("POST", "deleteWebhook", timeout=60)
-            resp = _telegram_request("POST", "setWebhook", json={"url": WEBHOOK_URL}, timeout=60)
+            # Try deleteWebhook but don't fail if it times out
+            try:
+                _telegram_request("POST", "deleteWebhook", timeout=60)
+            except Exception as e:
+                logger.warning(f"deleteWebhook failed (continuing): {e}")
+            
+            resp = _telegram_request("POST", "setWebhook", json={"url": WEBHOOK_URL}, timeout=180)
             logger.info(f"Webhook set: {resp.status_code} - {resp.text}")
         except Exception as e:
             logger.error(f"Webhook setup error: {e}")
