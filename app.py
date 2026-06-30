@@ -1,4 +1,4 @@
-# Patch requests.Session with 60s timeout BEFORE any other imports
+# Patch requests.Session with 120s timeout BEFORE any other imports
 # This is required for HF Spaces to connect to api.telegram.org:443
 import requests
 from requests.adapters import HTTPAdapter
@@ -8,17 +8,17 @@ from urllib3.util.retry import Retry
 _original_request = requests.Session.request
 
 def _patched_request(self, method, url, **kwargs):
-    # Force minimum 60 second timeout (HF Spaces needs longer for api.telegram.org)
-    timeout = kwargs.get('timeout', 60)
-    if isinstance(timeout, (int, float)) and timeout < 60:
-        kwargs['timeout'] = 60
+    # Force minimum 120 second timeout (HF Spaces needs longer for api.telegram.org)
+    timeout = kwargs.get('timeout', 120)
+    if isinstance(timeout, (int, float)) and timeout < 120:
+        kwargs['timeout'] = 120
     elif isinstance(timeout, tuple) and len(timeout) == 2:
         # (connect_timeout, read_timeout) - bump read_timeout if too low
         connect_t, read_t = timeout
-        if read_t < 60:
-            kwargs['timeout'] = (connect_t, 60)
+        if read_t < 120:
+            kwargs['timeout'] = (connect_t, 120)
     elif 'timeout' not in kwargs:
-        kwargs['timeout'] = 60
+        kwargs['timeout'] = 120
     return _original_request(self, method, url, **kwargs)
 
 requests.Session.request = _patched_request
