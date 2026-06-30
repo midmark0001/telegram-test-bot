@@ -8,8 +8,16 @@ from urllib3.util.retry import Retry
 _original_request = requests.Session.request
 
 def _patched_request(self, method, url, **kwargs):
-    # Set default timeout to 60 seconds if not provided
-    if 'timeout' not in kwargs:
+    # Force minimum 60 second timeout (HF Spaces needs longer for api.telegram.org)
+    timeout = kwargs.get('timeout', 60)
+    if isinstance(timeout, (int, float)) and timeout < 60:
+        kwargs['timeout'] = 60
+    elif isinstance(timeout, tuple) and len(timeout) == 2:
+        # (connect_timeout, read_timeout) - bump read_timeout if too low
+        connect_t, read_t = timeout
+        if read_t < 60:
+            kwargs['timeout'] = (connect_t, 60)
+    elif 'timeout' not in kwargs:
         kwargs['timeout'] = 60
     return _original_request(self, method, url, **kwargs)
 
