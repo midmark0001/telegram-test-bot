@@ -1,11 +1,10 @@
 import os
 import requests
-import telebot
 from flask import Flask, request, abort
 import logging
 import traceback
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
@@ -14,6 +13,7 @@ RENDER_URL = os.environ.get("RENDER_URL")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w342"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
@@ -24,7 +24,6 @@ if not TMDB_API_KEY:
 
 logger.info(f"Starting bot with token: {BOT_TOKEN[:10]}...")
 
-bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
 WEBHOOK_SECRET = BOT_TOKEN.split(":")[0]
@@ -34,18 +33,12 @@ WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
 logger.info(f"Webhook path: {WEBHOOK_PATH}")
 logger.info(f"Webhook URL: {WEBHOOK_URL}")
 
-# Set webhook at module level (runs when gunicorn imports the app)
-try:
-    bot.remove_webhook()
-    result = bot.set_webhook(url=WEBHOOK_URL)
-    logger.info(f"Webhook set at module load: {result}")
-except Exception as e:
-    logger.error(f"Error setting webhook at module load: {e}\n{traceback.format_exc()}")
-
+# In-memory cache for search results (user_id -> list of results)
 search_cache = {}
 
 
 def tmdb_search(query: str, page: int = 1):
+    """Search TMDB for movies and TV shows"""
     url = f"{TMDB_BASE_URL}/search/multi"
     params = {
         "api_key": TMDB_API_KEY,
@@ -66,6 +59,7 @@ def tmdb_search(query: str, page: int = 1):
 
 
 def tmdb_get_details(media_type: str, item_id: int):
+    """Get detailed info for a movie or TV show"""
     url = f"{TMDB_BASE_URL}/{media_type}/{item_id}"
     params = {
         "api_key": TMDB_API_KEY,
@@ -134,50 +128,86 @@ def format_details(data: dict, media_type: str) -> tuple[str, str | None]:
     return msg, poster_url
 
 
-@bot.message_handler(commands=["start", "help"])
-def send_welcome(message):
-    logger.info(f"/start or /help from {message.chat.id}")
-    text = (
-        "🎬 <b>TMDB Search Bot</b>\n\n"
-        "Search for movies and TV shows!\n\n"
-        "<b>How to use:</b>\n"
-        "• Type any movie/TV name to search\n"
-        "• Tap a result to see details\n"
-        "• Use inline mode: @Hemaitel_bot <query>\n\n"
-        "<b>Commands:</b>\n"
-        "/start - Show this message\n"
-        "/help - Show this message"
-    )
+def send_message(chat_id: int, text: str, reply_markup=None, parse_mode="HTML"):
+    """Send message via direct Telegram API"""
+    url = f"{TELEGRAM_API}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     try:
-        bot.send_message(message.chat.id, text, parse_mode="HTML")
-        logger.info("Welcome message sent")
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
     except Exception as e:
-        logger.error(f"Error sending welcome: {e}\n{traceback.format_exc()}")
+        logger.error(f"send_message error: {e}\n{traceback.format_exc()}")
+        return None
 
 
-@bot.message_handler(func=lambda m: True)
-def handle_search(message):
-    logger.info(f"Message from {message.chat.id}: {message.text}")
-    query = message.text.strip()
-    if not query:
-        return
-    
-    if query.startswith("/"):
-        return
-    
-    searching_msg = bot.send_message(message.chat.id, "🔍 Searching...")
-    logger.info(f"Sent searching message: {searching_msg.message_id}")
-    
-    results = tmdb_search(query)
-    logger.info(f"Found {len(results)} results for '{query}'")
-    
-    if not results:
-        bot.edit_message_text("No results found. Try a different query.", message.chat.id, searching_msg.message_id)
-        return
-    
-    search_cache[message.from_user.id] = results
-    
-    markup = telebot.types.InlineKeyboardMarkup(row_width=1)
+def edit_message(chat_id: int, message_id: int, text: str, reply_markup=None, parse_mode="HTML"):
+    """Edit message via direct Telegram API"""
+    url = f"{TELEGRAM_API}/editMessageText"
+    payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"edit_message error: {e}\n{traceback.format_exc()}")
+        return None
+
+
+def delete_message(chat_id: int, message_id: int):
+    """Delete message via direct Telegram API"""
+    url = f"{TELEGRAM_API}/deleteMessage"
+    payload = {"chat_id": chat_id, "message_id": message_id}
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"delete_message error: {e}\n{traceback.format_exc()}")
+        return None
+
+
+def answer_callback_query(callback_query_id: str, text: str = None):
+    """Answer callback query via direct Telegram API"""
+    url = f"{TELEGRAM_API}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"answer_callback_query error: {e}\n{traceback.format_exc()}")
+        return None
+
+
+def send_photo(chat_id: int, photo_url: str, caption: str = None, reply_markup=None, parse_mode="HTML"):
+    """Send photo via direct Telegram API"""
+    url = f"{TELEGRAM_API}/sendPhoto"
+    payload = {"chat_id": chat_id, "photo": photo_url}
+    if caption:
+        payload["caption"] = caption
+        payload["parse_mode"] = parse_mode
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        logger.error(f"send_photo error: {e}\n{traceback.format_exc()}")
+        return None
+
+
+# Build inline keyboard markup
+def build_results_keyboard(results: list, user_id: int):
+    """Build inline keyboard for search results"""
+    keyboard = {"inline_keyboard": []}
     for i, item in enumerate(results):
         if item["media_type"] == "movie":
             label = format_movie_result(item)
@@ -187,80 +217,164 @@ def handle_search(message):
             callback_data = f"detail:tv:{item['id']}:{i}"
         
         btn_text = label.split("\n")[0][:60]
-        markup.add(telebot.types.InlineKeyboardButton(btn_text, callback_data=callback_data))
+        keyboard["inline_keyboard"].append([{"text": btn_text, "callback_data": callback_data}])
     
-    markup.add(telebot.types.InlineKeyboardButton("🔍 Search again", callback_data="search_again"))
-    
-    try:
-        bot.edit_message_text(
-            f"🔍 <b>Results for:</b> {query}\n\nTap a result for details:",
-            message.chat.id,
-            searching_msg.message_id,
-            parse_mode="HTML",
-            reply_markup=markup
-        )
-        logger.info("Results message edited with inline keyboard")
-    except Exception as e:
-        logger.error(f"Error editing message: {e}\n{traceback.format_exc()}")
+    keyboard["inline_keyboard"].append([{"text": "🔍 Search again", "callback_data": "search_again"}])
+    return keyboard
 
 
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callback(call):
-    logger.info(f"Callback from {call.from_user.id}: {call.data}")
-    data = call.data
+def build_detail_keyboard():
+    """Build inline keyboard for detail view"""
+    return {"inline_keyboard": [[{"text": "🔍 New Search", "callback_data": "search_again"}]]}
+
+
+# Flask webhook
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def webhook():
+    logger.info(f"Webhook request from {request.remote_addr}")
+    if request.headers.get("content-type") == "application/json":
+        update = request.get_json()
+        logger.info(f"Received update: {update.get('update_id')}")
+        
+        try:
+            # Handle message
+            if "message" in update:
+                handle_message(update["message"])
+            # Handle callback query
+            elif "callback_query" in update:
+                handle_callback_query(update["callback_query"])
+            # Handle inline query
+            elif "inline_query" in update:
+                handle_inline_query(update["inline_query"])
+            
+            logger.info("Update processed")
+        except Exception as e:
+            logger.error(f"Error processing update: {e}\n{traceback.format_exc()}")
+        return "OK", 200
+    abort(403)
+
+
+def handle_message(message: dict):
+    """Handle incoming text message"""
+    chat_id = message["chat"]["id"]
+    user_id = message["from"]["id"]
+    text = message.get("text", "").strip()
+    message_id = message.get("message_id")
+    
+    logger.info(f"Message from {chat_id} (user {user_id}): {text}")
+    
+    if not text:
+        return
+    
+    if text.startswith("/"):
+        if text in ["/start", "/help"]:
+            welcome_text = (
+                "🎬 <b>TMDB Search Bot</b>\n\n"
+                "Search for movies and TV shows!\n\n"
+                "<b>How to use:</b>\n"
+                "• Type any movie/TV name to search\n"
+                "• Tap a result to see details\n"
+                "• Use inline mode: @Hemaitel_bot <query>\n\n"
+                "<b>Commands:</b>\n"
+                "/start - Show this message\n"
+                "/help - Show this message"
+            )
+            send_message(chat_id, welcome_text)
+        return
+    
+    # Search query
+    searching = send_message(chat_id, "🔍 Searching...")
+    if not searching:
+        return
+    
+    searching_msg_id = searching.get("result", {}).get("message_id")
+    results = tmdb_search(text)
+    logger.info(f"Found {len(results)} results for '{text}'")
+    
+    if not results:
+        edit_message(chat_id, searching_msg_id, "No results found. Try a different query.")
+        return
+    
+    # Cache results
+    search_cache[user_id] = results
+    
+    # Build keyboard
+    keyboard = build_results_keyboard(results, user_id)
+    
+    edit_message(
+        chat_id,
+        searching_msg_id,
+        f"🔍 <b>Results for:</b> {text}\n\nTap a result for details:",
+        reply_markup=keyboard
+    )
+
+
+def handle_callback_query(callback_query: dict):
+    """Handle inline button callback"""
+    callback_query_id = callback_query["id"]
+    user_id = callback_query["from"]["id"]
+    chat_id = callback_query["message"]["chat"]["id"]
+    message_id = callback_query["message"]["message_id"]
+    data = callback_query["data"]
+    
+    logger.info(f"Callback from {user_id}: {data}")
     
     if data == "search_again":
-        bot.answer_callback_query(call.id, "Type a new search query!")
+        answer_callback_query(callback_query_id, "Type a new search query!")
         return
     
     if data.startswith("detail:"):
         parts = data.split(":")
         if len(parts) != 4:
-            bot.answer_callback_query(call.id, "Invalid data")
+            answer_callback_query(callback_query_id, "Invalid data")
             return
         
         _, media_type, item_id_str, index_str = parts
         item_id = int(item_id_str)
         index = int(index_str)
         
-        bot.answer_callback_query(call.id, "Loading details...")
+        answer_callback_query(callback_query_id, "Loading details...")
         
-        cached = search_cache.get(call.from_user.id, [])
+        cached = search_cache.get(user_id, [])
         if index >= len(cached):
-            bot.edit_message_text("Result expired. Please search again.", call.message.chat.id, call.message.message_id)
+            edit_message(chat_id, message_id, "Result expired. Please search again.")
             return
         
         item = cached[index]
         if item["id"] != item_id or item["media_type"] != media_type:
-            bot.edit_message_text("Result mismatch. Please search again.", call.message.chat.id, call.message.message_id)
+            edit_message(chat_id, message_id, "Result mismatch. Please search again.")
             return
         
         details = tmdb_get_details(media_type, item_id)
         if not details:
-            bot.edit_message_text("Failed to fetch details. Try again.", call.message.chat.id, call.message.message_id)
+            edit_message(chat_id, message_id, "Failed to fetch details. Try again.")
             return
         
         msg_text, poster_url = format_details(details, media_type)
+        keyboard = build_detail_keyboard()
         
-        markup = telebot.types.InlineKeyboardMarkup()
-        markup.add(telebot.types.InlineKeyboardButton("🔍 New Search", callback_data="search_again"))
+        # Delete the results message
+        delete_message(chat_id, message_id)
         
-        try:
-            if poster_url:
-                bot.send_photo(call.message.chat.id, poster_url, caption=msg_text, parse_mode="HTML", reply_markup=markup)
-            else:
-                bot.send_message(call.message.chat.id, msg_text, parse_mode="HTML", reply_markup=markup)
-            
-            bot.delete_message(call.message.chat.id, call.message.message_id)
-            logger.info("Details sent successfully")
-        except Exception as e:
-            logger.error(f"Error sending details: {e}\n{traceback.format_exc()}")
+        # Send details with photo if available
+        if poster_url:
+            send_photo(chat_id, poster_url, caption=msg_text, reply_markup=keyboard)
+        else:
+            send_message(chat_id, msg_text, reply_markup=keyboard)
 
 
-@bot.inline_handler(func=lambda query: len(query.query) > 0)
-def inline_search(query):
-    logger.info(f"Inline query: {query.query}")
-    results = tmdb_search(query.query)
+def handle_inline_query(inline_query: dict):
+    """Handle inline query (@bot query)"""
+    query_id = inline_query["id"]
+    query_text = inline_query["query"]
+    user_id = inline_query["from"]["id"]
+    
+    logger.info(f"Inline query from {user_id}: {query_text}")
+    
+    if not query_text:
+        return
+    
+    results = tmdb_search(query_text)
     
     inline_results = []
     for i, item in enumerate(results):
@@ -274,16 +388,17 @@ def inline_search(query):
             
             content = f"<b>{title}</b> ({release})\n⭐ {rating}/10\n\n{overview}"
             
-            r = telebot.types.InlineQueryResultArticle(
-                id=f"movie_{item['id']}",
-                title=f"🎬 {title} ({release})",
-                description=f"⭐ {rating}/10 - {overview[:100]}",
-                input_message_content=telebot.types.InputTextMessageContent(
-                    message_text=content,
-                    parse_mode="HTML"
-                ),
-                thumb_url=thumb_url
-            )
+            r = {
+                "type": "article",
+                "id": f"movie_{item['id']}",
+                "title": f"🎬 {title} ({release})",
+                "description": f"⭐ {rating}/10 - {overview[:100]}",
+                "input_message_content": {
+                    "message_text": content,
+                    "parse_mode": "HTML"
+                },
+                "thumb_url": thumb_url
+            }
         else:
             name = item.get("name", "Unknown")
             air = item.get("first_air_date", "N/A")[:4] if item.get("first_air_date") else "N/A"
@@ -294,48 +409,50 @@ def inline_search(query):
             
             content = f"<b>{name}</b> ({air})\n⭐ {rating}/10\n\n{overview}"
             
-            r = telebot.types.InlineQueryResultArticle(
-                id=f"tv_{item['id']}",
-                title=f"📺 {name} ({air})",
-                description=f"⭐ {rating}/10 - {overview[:100]}",
-                input_message_content=telebot.types.InputTextMessageContent(
-                    message_text=content,
-                    parse_mode="HTML"
-                ),
-                thumb_url=thumb_url
-            )
+            r = {
+                "type": "article",
+                "id": f"tv_{item['id']}",
+                "title": f"📺 {name} ({air})",
+                "description": f"⭐ {rating}/10 - {overview[:100]}",
+                "input_message_content": {
+                    "message_text": content,
+                    "parse_mode": "HTML"
+                },
+                "thumb_url": thumb_url
+            }
         inline_results.append(r)
     
-    bot.answer_inline_query(query.id, inline_results, cache_time=300)
-
-
-# Flask webhook
-@app.route(WEBHOOK_PATH, methods=["POST"])
-def webhook():
-    logger.info(f"Webhook request from {request.remote_addr}")
-    if request.headers.get("content-type") == "application/json":
-        json_str = request.get_data().decode("utf-8")
-        logger.debug(f"Raw update: {json_str[:500]}")
-        try:
-            update = telebot.types.Update.de_json(json_str)
-            logger.info(f"Parsed update: {update.update_id}")
-            bot.process_new_updates([update])
-            logger.info("Update processed")
-        except Exception as e:
-            logger.error(f"Error processing update: {e}\n{traceback.format_exc()}")
-        return "OK", 200
-    abort(403)
+    # Answer inline query
+    url = f"{TELEGRAM_API}/answerInlineQuery"
+    payload = {"inline_query_id": query_id, "results": inline_results, "cache_time": 300}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        logger.error(f"answer_inline_query error: {e}\n{traceback.format_exc()}")
 
 
 @app.route("/")
-def set_webhook():
-    logger.info("Root endpoint accessed - webhook already set at module load")
+def root():
+    logger.info("Root endpoint accessed")
     return f"Webhook is set to {WEBHOOK_URL}", 200
 
 
 @app.route("/health")
 def health():
     return "OK", 200
+
+
+# Set webhook at module level (runs when gunicorn imports the app)
+try:
+    requests.post(f"{TELEGRAM_API}/deleteWebhook", timeout=10)
+    resp = requests.post(
+        f"{TELEGRAM_API}/setWebhook",
+        json={"url": WEBHOOK_URL},
+        timeout=10
+    )
+    logger.info(f"Webhook set at module load: {resp.status_code} - {resp.text}")
+except Exception as e:
+    logger.error(f"Error setting webhook at module load: {e}\n{traceback.format_exc()}")
 
 
 if __name__ == "__main__":
