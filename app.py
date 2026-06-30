@@ -14,6 +14,11 @@ if not RENDER_URL:
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
+# Use a webhook secret (first part of token + hash) instead of full token with colon
+WEBHOOK_SECRET = BOT_TOKEN.split(":")[0]  # Use numeric ID part as secret
+WEBHOOK_PATH = f"/{WEBHOOK_SECRET}"
+WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
+
 # Simple message handlers
 @bot.message_handler(commands=["start", "help"])
 def send_welcome(message):
@@ -38,9 +43,6 @@ def echo_all(message):
     bot.reply_to(message, f"You said: {message.text}")
 
 # Flask webhook endpoint
-WEBHOOK_PATH = f"/{BOT_TOKEN}"
-WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
-
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
     if request.headers.get("content-type") == "application/json":
