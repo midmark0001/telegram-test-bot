@@ -1,65 +1,26 @@
-# Patch requests.Session with 120s timeout BEFORE any other imports
-# This is required for HF Spaces to connect to api.telegram.org:443
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# Create retry strategy for SSL/connection errors on HF Spaces
-_retry_strategy = Retry(
-    total=5,
-    backoff_factor=2,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],
-    raise_on_status=False,
-)
-
-# Store original request method
-_original_request = requests.Session.request
-
-def _patched_request(self, method, url, **kwargs):
-    # Force minimum 120 second timeout (HF Spaces needs longer for api.telegram.org)
-    timeout = kwargs.get('timeout', 120)
-    if isinstance(timeout, (int, float)) and timeout < 120:
-        kwargs['timeout'] = 120
-    elif isinstance(timeout, tuple) and len(timeout) == 2:
-        # (connect_timeout, read_timeout) - bump read_timeout if too low
-        connect_t, read_t = timeout
-        if read_t < 120:
-            kwargs['timeout'] = (connect_t, 120)
-    elif 'timeout' not in kwargs:
-        kwargs['timeout'] = 120
-    return _original_request(self, method, url, **kwargs)
-
-requests.Session.request = _patched_request
-
-# Patch Session to auto-mount retry adapter for HTTPS
-_original_session_init = requests.Session.__init__
-
-def _patched_session_init(self, *args, **kwargs):
-    _original_session_init(self, *args, **kwargs)
-    # Mount retry adapter for HTTPS (handles SSL EOF, connection resets)
-    adapter = HTTPAdapter(max_retries=_retry_strategy, pool_connections=50, pool_maxsize=50)
-    self.mount("https://", adapter)
-    self.mount("http://", adapter)
-
-requests.Session.__init__ = _patched_session_init
-
-# Now import everything else
+# ======================================================================
+# IMPORTS
+# ======================================================================
 import os
 import hashlib
 import threading
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, request, abort
 import logging
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from flask import Flask, request, abort
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# ======================================================================
+# CONFIGURATION
+# ======================================================================
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Configuration
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-SPACE_URL = os.environ.get("SPACE_URL")  # e.g., https://username-space.hf.space
+SPACE_URL = os.environ.get("SPACE_URL")
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w342"
@@ -92,58 +53,46 @@ logger.info(f"Webhook path: {WEBHOOK_PATH}")
 logger.info(f"Webhook URL: {WEBHOOK_URL}")
 
 # In-memory caches
-search_cache = {}  # user_id -> list of search results
-download_sessions = {}  # user_id -> {progress_msg_id, cancel_flag, temp_path}
+search_cache = {}
+download_sessions = {}
 
-
-# ======================================================================
-# PoW SOLVER (from download_noplayer.py)
-# ======================================================================
-def solve_proof_of_work(challenge: str, difficulty: int) -> str:
-    """Finds a nonce such that SHA-256(challenge + nonce) has N leading zero bits."""
-    full_bytes = difficulty // 8
-    remaining_bits = difficulty % 8
-    mask = (0xff << (8 - remaining_bits)) & 0xff if remaining_bits > 0 else 0
-
-    nonce = 0
-    challenge_bytes = challenge.encode('utf-8')
-    sha256 = hashlib.sha256
-
-    logger.info(f"⚡ PoW Solver Started. Difficulty: {difficulty} bits...")
-
-    while True:
-        text = challenge_bytes + str(nonce).encode('utf-8')
-        digest = sha256(text).digest()
-
-        is_match = True
-        for i in range(full_bytes):
-            if digest[i] != 0:
-                is_match = False
-                break
-
-        if is_match and remaining_bits > 0:
-            if (digest[full_bytes] & mask) != 0:
-                is_match = False
-
-        if is_match:
-            logger.info(f"🎯 PoW Puzzle Solved! Nonce found: {nonce}")
-            return str(nonce)
-
-        nonce += 1
-        if nonce > 50000000:
-            raise Exception("PoW execution safety threshold exceeded.")
-
+# Webhook setup flag (lazy init on first request)
+_webhook_initialized = False
+_webhook_lock = threading.Lock()
 
 # ======================================================================
-# TELEGRAM API HELPERS
+# TELEGRAM API HELPERS WITH RETRY
 # ======================================================================
+# Create a session with retry strategy for Telegram API
+_telegram_session = requests.Session()
+_retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],
+    raise_on_status=False,
+)
+_adapter = HTTPAdapter(max_retries=_retry_strategy, pool_connections=20, pool_maxsize=20)
+_telegram_session.mount("https://", _adapter)
+_telegram_session.mount("http://", _adapter)
+
+def _telegram_request(method: str, endpoint: str, **kwargs):
+    """Make Telegram API request with retry and 60s timeout"""
+    timeout = kwargs.pop('timeout', 60)
+    url = f"{TELEGRAM_API}/{endpoint}"
+    try:
+        return _telegram_session.request(method, url, timeout=timeout, **kwargs)
+    except Exception as e:
+        logger.error(f"Telegram API {method} {endpoint} failed: {e}")
+        raise
+
+
 def send_message(chat_id: int, text: str, reply_markup=None, parse_mode="HTML"):
-    url = f"{TELEGRAM_API}/sendMessage"
     payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        resp = requests.post(url, json=payload)
+        resp = _telegram_request("POST", "sendMessage", json=payload)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -152,12 +101,11 @@ def send_message(chat_id: int, text: str, reply_markup=None, parse_mode="HTML"):
 
 
 def edit_message(chat_id: int, message_id: int, text: str, reply_markup=None, parse_mode="HTML"):
-    url = f"{TELEGRAM_API}/editMessageText"
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode": parse_mode}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        resp = requests.post(url, json=payload)
+        resp = _telegram_request("POST", "editMessageText", json=payload)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -166,26 +114,23 @@ def edit_message(chat_id: int, message_id: int, text: str, reply_markup=None, pa
 
 
 def delete_message(chat_id: int, message_id: int):
-    url = f"{TELEGRAM_API}/deleteMessage"
     try:
-        requests.post(url, json={"chat_id": chat_id, "message_id": message_id})
+        _telegram_request("POST", "deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
     except:
         pass
 
 
 def answer_callback_query(callback_query_id: str, text: str = None):
-    url = f"{TELEGRAM_API}/answerCallbackQuery"
     payload = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
     try:
-        requests.post(url, json=payload)
+        _telegram_request("POST", "answerCallbackQuery", json=payload)
     except:
         pass
 
 
 def send_video(chat_id: int, video_path: str, caption: str = None, reply_markup=None):
-    """Send video file to user"""
     url = f"{TELEGRAM_API}/sendVideo"
     try:
         with open(video_path, "rb") as f:
@@ -197,7 +142,7 @@ def send_video(chat_id: int, video_path: str, caption: str = None, reply_markup=
             if reply_markup:
                 import json
                 data["reply_markup"] = json.dumps(reply_markup)
-            resp = requests.post(url, data=data, files=files, timeout=180)
+            resp = _telegram_session.post(url, data=data, files=files, timeout=180)
             resp.raise_for_status()
             return resp.json()
     except Exception as e:
@@ -206,7 +151,6 @@ def send_video(chat_id: int, video_path: str, caption: str = None, reply_markup=
 
 
 def send_document(chat_id: int, file_path: str, caption: str = None):
-    """Send as document if video fails"""
     url = f"{TELEGRAM_API}/sendDocument"
     try:
         with open(file_path, "rb") as f:
@@ -215,7 +159,7 @@ def send_document(chat_id: int, file_path: str, caption: str = None):
             if caption:
                 data["caption"] = caption
                 data["parse_mode"] = "HTML"
-            resp = requests.post(url, data=data, files=files, timeout=180)
+            resp = _telegram_session.post(url, data=data, files=files, timeout=180)
             resp.raise_for_status()
             return resp.json()
     except Exception as e:
@@ -224,7 +168,6 @@ def send_document(chat_id: int, file_path: str, caption: str = None):
 
 
 def send_photo(chat_id: int, photo_url: str, caption: str = None, reply_markup=None):
-    url = f"{TELEGRAM_API}/sendPhoto"
     payload = {"chat_id": chat_id, "photo": photo_url}
     if caption:
         payload["caption"] = caption
@@ -233,7 +176,7 @@ def send_photo(chat_id: int, photo_url: str, caption: str = None, reply_markup=N
         import json
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        requests.post(url, json=payload)
+        _telegram_request("POST", "sendPhoto", json=payload)
     except:
         pass
 
@@ -256,7 +199,6 @@ def build_results_keyboard(results: list):
 
 
 def build_detail_keyboard(item_id: int, media_type: str):
-    """Detail view with Download button above New Search"""
     return {
         "inline_keyboard": [
             [{"text": "📥 Download MP4", "callback_data": f"download:{media_type}:{item_id}"}],
@@ -276,7 +218,7 @@ def tmdb_search(query: str, page: int = 1):
     url = f"{TMDB_BASE_URL}/search/multi"
     params = {"api_key": TMDB_API_KEY, "query": query, "page": page, "include_adult": "false", "language": "en-US"}
     try:
-        resp = requests.get(url, params=params)
+        resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         return [r for r in data.get("results", []) if r.get("media_type") in ("movie", "tv")][:10]
@@ -288,7 +230,7 @@ def tmdb_get_details(media_type: str, item_id: int):
     url = f"{TMDB_BASE_URL}/{media_type}/{item_id}"
     params = {"api_key": TMDB_API_KEY, "append_to_response": "credits,videos,images", "language": "en-US"}
     try:
-        resp = requests.get(url, params=params)
+        resp = requests.get(url, params=params, timeout=30)
         resp.raise_for_status()
         return resp.json()
     except:
@@ -323,12 +265,11 @@ def format_details(data: dict, media_type: str) -> tuple[str, str | None]:
 
 
 # ======================================================================
-# MAPPLE.RIP HANDSHAKE & DOWNLOAD (from download_noplayer.py)
+# MAPPLE.RIP HANDSHAKE & DOWNLOAD
 # ======================================================================
 def get_mapple_session():
-    """Create session with proper headers"""
     session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=3)
+    adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50, max_retries=3)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.headers.update({
@@ -339,22 +280,52 @@ def get_mapple_session():
     return session
 
 
+def solve_proof_of_work(challenge: str, difficulty: int) -> str:
+    full_bytes = difficulty // 8
+    remaining_bits = difficulty % 8
+    mask = (0xff << (8 - remaining_bits)) & 0xff if remaining_bits > 0 else 0
+
+    nonce = 0
+    challenge_bytes = challenge.encode('utf-8')
+    sha256 = hashlib.sha256
+
+    logger.info(f"⚡ PoW Solver Started. Difficulty: {difficulty} bits...")
+
+    while True:
+        text = challenge_bytes + str(nonce).encode('utf-8')
+        digest = sha256(text).digest()
+
+        is_match = True
+        for i in range(full_bytes):
+            if digest[i] != 0:
+                is_match = False
+                break
+
+        if is_match and remaining_bits > 0:
+            if (digest[full_bytes] & mask) != 0:
+                is_match = False
+
+        if is_match:
+            logger.info(f"🎯 PoW Puzzle Solved! Nonce found: {nonce}")
+            return str(nonce)
+
+        nonce += 1
+        if nonce > 50000000:
+            raise Exception("PoW execution safety threshold exceeded.")
+
+
 def execute_handshake(session: requests.Session, item_id: int, media_type: str):
-    """Execute the mapple.rip handshake to get stream URL"""
-    # Step 1: Get requestToken from watch page
     watch_url = MAPPLE_WATCH_URL.format(media_type=media_type, item_id=item_id)
-    page_res = session.get(watch_url)
+    page_res = session.get(watch_url, timeout=30)
 
     import re
     token_match = re.search(r'"requestToken"\s*:\s*"([^"]+)"', page_res.text)
     request_token = token_match.group(1) if token_match else "eyJub2...yy8E"
 
-    # Step 2: Initial playback init
     init_payload = {"mediaId": item_id, "mediaType": media_type, "requestToken": request_token}
-    res1 = session.post(MAPPLE_PLAYBACK_INIT, json=init_payload)
+    res1 = session.post(MAPPLE_PLAYBACK_INIT, json=init_payload, timeout=30)
     data1 = res1.json()
 
-    # Step 3: PoW if required
     if data1.get("success") and data1.get("requiresPow"):
         pow_meta = data1["pow"]
         resolved_nonce = solve_proof_of_work(pow_meta["challenge"], pow_meta["difficulty"])
@@ -362,7 +333,7 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
             **init_payload,
             "pow": {"challengeId": pow_meta["challengeId"], "nonce": resolved_nonce}
         }
-        res2 = session.post(MAPPLE_PLAYBACK_INIT, json=verification_payload)
+        res2 = session.post(MAPPLE_PLAYBACK_INIT, json=verification_payload, timeout=30)
         data2 = res2.json()
     else:
         data2 = data1
@@ -372,7 +343,6 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
 
     final_playback_token = data2["token"]
 
-    # Step 4: Get stream URL
     stream_params = {
         "mediaId": item_id,
         "mediaType": media_type,
@@ -382,7 +352,7 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
         "requestToken": request_token,
         "token": final_playback_token
     }
-    res3 = session.get(MAPPLE_STREAM_API, params=stream_params)
+    res3 = session.get(MAPPLE_STREAM_API, params=stream_params, timeout=30)
     data3 = res3.json()
 
     if data3.get("success") and "data" in data3:
@@ -391,23 +361,19 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
 
 
 def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, progress_msg_id: int):
-    """Download HLS or MP4 with live progress updates"""
     session = get_mapple_session()
     safe_title = "".join([c for c in title if c.isalnum() or c in (" ", "_", "-")]).strip()
 
-    # Create temp file
     temp_dir = tempfile.gettempdir()
     temp_path = os.path.join(temp_dir, f"{safe_title}_{user_id}.mp4")
 
     download_sessions[user_id] = {"progress_msg_id": progress_msg_id, "cancel": False, "temp_path": temp_path}
 
     try:
-        # Check if HLS
-        head_check = session.get(stream_url)
+        head_check = session.get(stream_url, timeout=30)
         manifest_content = head_check.text.strip()
 
         if manifest_content.startswith("#EXTM3U"):
-            # HLS - find variant playlist
             variant_playlist_url = stream_url
             lines = manifest_content.splitlines()
             for i, line in enumerate(lines):
@@ -418,7 +384,7 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
                         variant_playlist_url = urljoin(stream_url, next_line)
                         break
 
-            variant_res = session.get(variant_playlist_url)
+            variant_res = session.get(variant_playlist_url, timeout=30)
             segment_urls = []
             for line in variant_res.text.splitlines():
                 cleaned = line.strip()
@@ -438,14 +404,13 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
                 if download_sessions.get(user_id, {}).get("cancel"):
                     return None
                 try:
-                    r = session.get(chunk_url)
+                    r = session.get(chunk_url, timeout=30)
                     if r.status_code == 200:
                         return chunk_index, r.content
                 except:
                     pass
                 return None
 
-            # Update initial progress
             edit_message(chat_id, progress_msg_id, f"📥 <b>Downloading:</b> {title}\n\n🔍 Initializing...\n0%", reply_markup=build_download_progress_keyboard())
 
             with ThreadPoolExecutor(max_workers=40) as executor:
@@ -473,7 +438,6 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
             if download_sessions.get(user_id, {}).get("cancel"):
                 return None
 
-            # Write to disk
             edit_message(chat_id, progress_msg_id,
                 f"📥 <b>Downloading:</b> {title}\n\n💾 Writing to disk... 100%",
                 reply_markup=build_download_progress_keyboard())
@@ -486,8 +450,7 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
             memory_buffer.clear()
 
         else:
-            # Direct MP4
-            with session.get(stream_url, stream=True) as response:
+            with session.get(stream_url, stream=True, timeout=30) as response:
                 if response.status_code != 200:
                     raise Exception("Server connection dropped")
                 total_bytes = int(response.headers.get('content-length', 0))
@@ -518,7 +481,6 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
 
 
 def handle_download_callback(callback_query: dict):
-    """Handle download button click"""
     callback_query_id = callback_query["id"]
     user_id = callback_query["from"]["id"]
     chat_id = callback_query["message"]["chat"]["id"]
@@ -528,77 +490,62 @@ def handle_download_callback(callback_query: dict):
     if data == "download_cancel":
         if user_id in download_sessions:
             download_sessions[user_id]["cancel"] = True
-        answer_callback_query(callback_query_id, "Cancelling download...")
+        answer_callback_query(callback_query_id, "Download cancelled")
         return
 
-    # Parse: download:media_type:item_id
-    parts = data.split(":")
-    if len(parts) != 3:
-        answer_callback_query(callback_query_id, "Invalid data")
-        return
+    if data.startswith("download:"):
+        _, media_type, item_id_str = data.split(":")
+        item_id = int(item_id_str)
 
-    _, media_type, item_id_str = parts
-    item_id = int(item_id_str)
+        answer_callback_query(callback_query_id, "Starting download...")
 
-    answer_callback_query(callback_query_id, "Starting download...")
+        # Get details for title
+        details = tmdb_get_details(media_type, item_id)
+        if not details:
+            edit_message(chat_id, message_id, "❌ Failed to get media details")
+            return
+        title = details.get("title") or details.get("name") or "Unknown"
 
-    # Send initial progress message
-    progress_msg = send_message(chat_id, "🔄 Initializing download...", reply_markup=build_download_progress_keyboard())
-    if not progress_msg:
-        return
-    progress_msg_id = progress_msg.get("result", {}).get("message_id")
+        progress_text = f"📥 <b>Downloading:</b> {title}\n\n🔍 Starting handshake..."
+        edit_message(chat_id, message_id, progress_text, reply_markup=build_download_progress_keyboard())
 
-    # Run download in background
-    def run_download():
-        try:
-            # Execute handshake
-            session = get_mapple_session()
-            edit_message(chat_id, progress_msg_id, "🔐 Handshaking with server...", reply_markup=build_download_progress_keyboard())
+        def download_task():
+            try:
+                session = get_mapple_session()
+                stream_url = execute_handshake(session, item_id, media_type)
 
-            stream_url = execute_handshake(session, item_id, media_type)
+                edit_message(chat_id, message_id,
+                    f"📥 <b>Downloading:</b> {title}\n\n✅ Stream URL obtained\n🔍 Initializing download...",
+                    reply_markup=build_download_progress_keyboard())
 
-            edit_message(chat_id, progress_msg_id, "📥 Starting download...", reply_markup=build_download_progress_keyboard())
+                temp_path = download_stream(chat_id, user_id, stream_url, title, message_id)
+                if not temp_path:
+                    return
 
-            # Get title from cached result
-            cached = search_cache.get(user_id, [])
-            title = "Video"
-            for item in cached:
-                if item.get("id") == item_id and item.get("media_type") == media_type:
-                    title = item.get("title") or item.get("name") or "Video"
-                    break
+                edit_message(chat_id, message_id,
+                    f"📥 <b>Downloading:</b> {title}\n\n✅ Download complete\n📤 Sending video...",
+                    reply_markup=None)
 
-            # Download
-            temp_path = download_stream(chat_id, user_id, stream_url, title, progress_msg_id)
-
-            if temp_path and os.path.exists(temp_path):
-                file_size = os.path.getsize(temp_path)
-
-                # Send video
-                edit_message(chat_id, progress_msg_id, f"📤 Sending video ({file_size / 1024 / 1024:.1f} MB)...")
-
-                keyboard = {"inline_keyboard": [[{"text": "🔍 New Search", "callback_data": "search_again"}]]}
-
-                result = send_video(chat_id, temp_path, caption=f"🎬 {title}", reply_markup=keyboard)
-
-                if not result:
-                    # Try as document
-                    send_document(chat_id, temp_path, caption=f"🎬 {title}")
+                send_video(chat_id, temp_path, caption=f"🎬 {title}")
 
                 # Cleanup
                 try:
                     os.remove(temp_path)
+                    logger.info(f"Cleaned up temp file: {temp_path}")
                 except:
                     pass
 
-                edit_message(chat_id, progress_msg_id, f"✅ <b>Done!</b> {title} sent successfully!", reply_markup=keyboard)
-            else:
-                edit_message(chat_id, progress_msg_id, "❌ Download failed - file not created", reply_markup={"inline_keyboard": [[{"text": "🔍 New Search", "callback_data": "search_again"}]]})
+                edit_message(chat_id, message_id,
+                    f"✅ <b>Done!</b> {title}\n\nVideo sent successfully! 🎬",
+                    reply_markup=build_detail_keyboard(item_id, media_type))
 
-        except Exception as e:
-            logger.error(f"Download pipeline error: {e}\n{traceback.format_exc()}")
-            edit_message(chat_id, progress_msg_id, f"❌ <b>Download failed:</b> {str(e)[:200]}", reply_markup={"inline_keyboard": [[{"text": "🔍 New Search", "callback_data": "search_again"}]]})
+            except Exception as e:
+                logger.error(f"Download failed: {e}\n{traceback.format_exc()}")
+                edit_message(chat_id, message_id,
+                    f"❌ <b>Download failed:</b> {title}\n\n{str(e)[:200]}",
+                    reply_markup=build_detail_keyboard(item_id, media_type))
 
-    threading.Thread(target=run_download, daemon=True).start()
+        threading.Thread(target=download_task, daemon=True).start()
 
 
 # ======================================================================
@@ -609,38 +556,39 @@ def handle_message(message: dict):
     user_id = message["from"]["id"]
     text = message.get("text", "").strip()
 
-    if not text:
+    if text == "/start":
+        send_message(chat_id,
+            "🎬 <b>Welcome to Movie Bot!</b>\n\n"
+            "Send me a movie or TV show name to search.\n\n"
+            "Features:\n"
+            "• Search TMDB (movies & TV)\n"
+            "• View details: poster, cast, genres, rating\n"
+            "• 📥 Download MP4 via mapple.rip\n"
+            "• Live progress updates\n"
+            "• Inline mode: @Hemaitel_bot <query>",
+            parse_mode="HTML")
         return
 
-    if text.startswith("/"):
-        if text in ["/start", "/help"]:
-            welcome = (
-                "🎬 <b>TMDB Search Bot</b>\n\n"
-                "Search movies & TV shows!\n\n"
-                "<b>How to use:</b>\n"
-                "• Type any name to search\n"
-                "• Tap result for details\n"
-                "• Tap 📥 Download MP4 to download\n"
-                "• Use inline: @Hemaitel_bot <query>\n\n"
-                "<b>Commands:</b>\n/start, /help"
-            )
-            send_message(chat_id, welcome)
+    if text == "/help":
+        send_message(chat_id,
+            "📖 <b>Help</b>\n\n"
+            "• Type any movie/TV name to search\n"
+            "• Tap result for details + download\n"
+            "• Tap 📥 Download MP4 for video\n"
+            "• Inline: @Hemaitel_bot <query>",
+            parse_mode="HTML")
         return
 
     # Search
-    searching = send_message(chat_id, "🔍 Searching...")
-    if not searching:
-        return
-    searching_msg_id = searching.get("result", {}).get("message_id")
+    if text:
+        send_message(chat_id, "🔍 Searching...")
+        results = tmdb_search(text)
+        if not results:
+            send_message(chat_id, "❌ No results found. Try a different query.")
+            return
 
-    results = tmdb_search(text)
-    if not results:
-        edit_message(chat_id, searching_msg_id, "No results found.")
-        return
-
-    search_cache[user_id] = results
-    keyboard = build_results_keyboard(results)
-    edit_message(chat_id, searching_msg_id, f"🔍 <b>Results for:</b> {text}\n\nTap for details:", reply_markup=keyboard)
+        search_cache[user_id] = results
+        send_message(chat_id, "🔍 <b>Search Results:</b>", reply_markup=build_results_keyboard(results), parse_mode="HTML")
 
 
 def handle_callback_query(callback_query: dict):
@@ -651,84 +599,84 @@ def handle_callback_query(callback_query: dict):
     data = callback_query["data"]
 
     if data == "search_again":
-        answer_callback_query(callback_query_id, "Type a new search!")
+        answer_callback_query(callback_query_id, "Ready for new search")
+        send_message(chat_id, "🔍 Send me a movie or TV show name to search.")
         return
 
     if data.startswith("detail:"):
-        # detail:media_type:item_id:index
-        parts = data.split(":")
-        if len(parts) != 4:
-            return
-        _, media_type, item_id_str, index_str = parts
+        _, media_type, item_id_str, idx_str = data.split(":")
         item_id = int(item_id_str)
-        index = int(index_str)
+        idx = int(idx_str)
 
-        answer_callback_query(callback_query_id, "Loading details...")
+        results = search_cache.get(user_id, [])
+        if idx < len(results):
+            item = results[idx]
+            if item["id"] == item_id and item["media_type"] == media_type:
+                answer_callback_query(callback_query_id, "Loading details...")
+                details = tmdb_get_details(media_type, item_id)
+                if details:
+                    msg, poster_url = format_details(details, media_type)
+                    if poster_url:
+                        send_photo(chat_id, poster_url, caption=msg, reply_markup=build_detail_keyboard(item_id, media_type))
+                    else:
+                        send_message(chat_id, msg, reply_markup=build_detail_keyboard(item_id, media_type), parse_mode="HTML")
+                else:
+                    send_message(chat_id, "❌ Failed to load details")
+        return
 
-        cached = search_cache.get(user_id, [])
-        if index >= len(cached):
-            edit_message(chat_id, message_id, "Expired. Search again.")
-            return
-
-        item = cached[index]
-        if item["id"] != item_id or item["media_type"] != media_type:
-            edit_message(chat_id, message_id, "Mismatch. Search again.")
-            return
-
-        details = tmdb_get_details(media_type, item_id)
-        if not details:
-            edit_message(chat_id, message_id, "Failed to fetch details.")
-            return
-
-        msg_text, poster_url = format_details(details, media_type)
-        keyboard = build_detail_keyboard(item_id, media_type)
-
-        delete_message(chat_id, message_id)
-
-        if poster_url:
-            send_photo(chat_id, poster_url, caption=msg_text, reply_markup=keyboard)
-        else:
-            send_message(chat_id, msg_text, reply_markup=keyboard)
-
-    elif data.startswith("download:"):
+    if data.startswith("download:"):
         handle_download_callback(callback_query)
+        return
+
+    if data == "download_cancel":
+        handle_download_callback(callback_query)
+        return
 
 
 def handle_inline_query(inline_query: dict):
     query_id = inline_query["id"]
-    query_text = inline_query["query"]
+    query_text = inline_query["query"].strip()
     if not query_text:
         return
 
     results = tmdb_search(query_text)
     inline_results = []
-    for item in results:
+    for i, item in enumerate(results):
+        name = item.get("title") or item.get("name") or "Unknown"
+        air = item.get("release_date" if item["media_type"] == "movie" else "first_air_date", "N/A")[:4]
+        rating = item.get("vote_average", 0)
+        overview = item.get("overview", "No description")[:200]
+        poster = item.get("poster_path")
+        thumb = f"{TMDB_IMAGE_BASE}{poster}" if poster else None
         if item["media_type"] == "movie":
-            title = item.get("title", "Unknown")
-            release = item.get("release_date", "N/A")[:4] if item.get("release_date") else "N/A"
-            rating = item.get("vote_average", 0)
-            overview = item.get("overview", "No description")[:200]
-            poster = item.get("poster_path")
-            thumb = f"{TMDB_IMAGE_BASE}{poster}" if poster else None
-            content = f"<b>{title}</b> ({release})\n⭐ {rating}/10\n\n{overview}"
-            r = {"type": "article", "id": f"movie_{item['id']}", "title": f"🎬 {title} ({release})",
+            content = f"<b>{name}</b> ({air})\n⭐ {rating}/10\n\n{overview}"
+            r = {"type": "article", "id": f"movie_{item['id']}", "title": f"🎬 {name} ({air})",
                  "description": f"⭐ {rating}/10 - {overview[:100]}",
                  "input_message_content": {"message_text": content, "parse_mode": "HTML"}, "thumb_url": thumb}
         else:
-            name = item.get("name", "Unknown")
-            air = item.get("first_air_date", "N/A")[:4] if item.get("first_air_date") else "N/A"
-            rating = item.get("vote_average", 0)
-            overview = item.get("overview", "No description")[:200]
-            poster = item.get("poster_path")
-            thumb = f"{TMDB_IMAGE_BASE}{poster}" if poster else None
             content = f"<b>{name}</b> ({air})\n⭐ {rating}/10\n\n{overview}"
             r = {"type": "article", "id": f"tv_{item['id']}", "title": f"📺 {name} ({air})",
                  "description": f"⭐ {rating}/10 - {overview[:100]}",
                  "input_message_content": {"message_text": content, "parse_mode": "HTML"}, "thumb_url": thumb}
         inline_results.append(r)
 
-    requests.post(f"{TELEGRAM_API}/answerInlineQuery",
+    _telegram_request("POST", "answerInlineQuery",
         json={"inline_query_id": query_id, "results": inline_results, "cache_time": 300})
+
+
+def setup_webhook():
+    """Lazy webhook setup - called on first request"""
+    global _webhook_initialized
+    with _webhook_lock:
+        if _webhook_initialized:
+            return
+        try:
+            _telegram_request("POST", "deleteWebhook", timeout=20)
+            resp = _telegram_request("POST", "setWebhook", json={"url": WEBHOOK_URL}, timeout=20)
+            logger.info(f"Webhook set: {resp.status_code} - {resp.text}")
+        except Exception as e:
+            logger.error(f"Webhook setup error: {e}")
+        _webhook_initialized = True
 
 
 # ======================================================================
@@ -736,6 +684,9 @@ def handle_inline_query(inline_query: dict):
 # ======================================================================
 @app.route(WEBHOOK_PATH, methods=["POST"])
 def webhook():
+    # Lazy webhook setup on first request
+    setup_webhook()
+
     if request.headers.get("content-type") == "application/json":
         update = request.get_json()
         try:
@@ -761,13 +712,9 @@ def health():
     return "OK", 200
 
 
-# Set webhook at module load
-try:
-    requests.post(f"{TELEGRAM_API}/deleteWebhook")
-    resp = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL})
-    logger.info(f"Webhook set: {resp.status_code} - {resp.text}")
-except Exception as e:
-    logger.error(f"Webhook setup error: {e}")
+@app.route("/test")
+def test():
+    return "OK", 200
 
 
 if __name__ == "__main__":
