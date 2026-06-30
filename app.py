@@ -1,9 +1,25 @@
-import os
+# Patch requests.Session with 60s timeout BEFORE any other imports
+# This is required for HF Spaces to connect to api.telegram.org:443
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# Store original request method
+_original_request = requests.Session.request
+
+def _patched_request(self, method, url, **kwargs):
+    # Set default timeout to 60 seconds if not provided
+    if 'timeout' not in kwargs:
+        kwargs['timeout'] = 60
+    return _original_request(self, method, url, **kwargs)
+
+requests.Session.request = _patched_request
+
+# Now import everything else
+import os
 import hashlib
 import threading
 import tempfile
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, abort
 import logging
@@ -14,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-RENDER_URL = os.environ.get("RENDER_URL")
+SPACE_URL = os.environ.get("SPACE_URL")  # e.g., https://username-space.hf.space
 TMDB_API_KEY = os.environ.get("TMDB_API_KEY")
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w342"
@@ -30,8 +46,8 @@ MAPPLE_ORIGIN = "https://mapple.rip/"
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN environment variable is required")
-if not RENDER_URL:
-    raise ValueError("RENDER_URL environment variable is required")
+if not SPACE_URL:
+    raise ValueError("SPACE_URL environment variable is required")
 if not TMDB_API_KEY:
     raise ValueError("TMDB_API_KEY environment variable is required")
 
@@ -41,14 +57,14 @@ app = Flask(__name__)
 
 WEBHOOK_SECRET = BOT_TOKEN.split(":")[0]
 WEBHOOK_PATH = f"/{WEBHOOK_SECRET}"
-WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
+WEBHOOK_URL = f"{SPACE_URL}{WEBHOOK_PATH}"
 
 logger.info(f"Webhook path: {WEBHOOK_PATH}")
 logger.info(f"Webhook URL: {WEBHOOK_URL}")
 
 # In-memory caches
 search_cache = {}  # user_id -> list of search results
-download_sessions = {}  # user_id -> {progress_msg_id, status, cancel_flag}
+download_sessions = {}  # user_id -> {progress_msg_id, cancel_flag, temp_path}
 
 
 # ======================================================================
@@ -102,6 +118,7 @@ def send_message(chat_id: int, text: str, reply_markup=None, parse_mode="HTML"):
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
+        logger.error(f"send_message error: {e}")
         return None
 
 
@@ -114,7 +131,8 @@ def edit_message(chat_id: int, message_id: int, text: str, reply_markup=None, pa
         resp = requests.post(url, json=payload, timeout=10)
         resp.raise_for_status()
         return resp.json()
-    except:
+    except Exception as e:
+        logger.error(f"edit_message error: {e}")
         return None
 
 
@@ -150,7 +168,7 @@ def send_video(chat_id: int, video_path: str, caption: str = None, reply_markup=
             if reply_markup:
                 import json
                 data["reply_markup"] = json.dumps(reply_markup)
-            resp = requests.post(url, data=data, files=files, timeout=120)
+            resp = requests.post(url, data=data, files=files, timeout=180)
             resp.raise_for_status()
             return resp.json()
     except Exception as e:
@@ -168,12 +186,27 @@ def send_document(chat_id: int, file_path: str, caption: str = None):
             if caption:
                 data["caption"] = caption
                 data["parse_mode"] = "HTML"
-            resp = requests.post(url, data=data, files=files, timeout=120)
+            resp = requests.post(url, data=data, files=files, timeout=180)
             resp.raise_for_status()
             return resp.json()
     except Exception as e:
         logger.error(f"send_document error: {e}")
         return None
+
+
+def send_photo(chat_id: int, photo_url: str, caption: str = None, reply_markup=None):
+    url = f"{TELEGRAM_API}/sendPhoto"
+    payload = {"chat_id": chat_id, "photo": photo_url}
+    if caption:
+        payload["caption"] = caption
+        payload["parse_mode"] = "HTML"
+    if reply_markup:
+        import json
+        payload["reply_markup"] = json.dumps(reply_markup)
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except:
+        pass
 
 
 # ======================================================================
@@ -282,10 +315,10 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
     # Step 1: Get requestToken from watch page
     watch_url = MAPPLE_WATCH_URL.format(media_type=media_type, item_id=item_id)
     page_res = session.get(watch_url, timeout=10)
-    
+
     import re
     token_match = re.search(r'"requestToken"\s*:\s*"([^"]+)"', page_res.text)
-    request_token = token_match.group(1) if token_match else "eyJub25jZSI6ImM0Y2RiNjJjYTg1ZjNmNTNiNzZkNzA4YzhlZWEzNDYyIiwiaWF0IjoxNzgyODUxODU3NTk2LCJleHAiOjE3ODI4NzM0NTc1OTYsInBhdGgiOiIvIn0.AR_VHfbsBQ4KS9n9utTrXP7s2HtN7GNp-RhlgJ-yy8E"
+    request_token = token_match.group(1) if token_match else "eyJub2...yy8E"
 
     # Step 2: Initial playback init
     init_payload = {"mediaId": item_id, "mediaType": media_type, "requestToken": request_token}
@@ -332,7 +365,7 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
     """Download HLS or MP4 with live progress updates"""
     session = get_mapple_session()
     safe_title = "".join([c for c in title if c.isalnum() or c in (" ", "_", "-")]).strip()
-    
+
     # Create temp file
     temp_dir = tempfile.gettempdir()
     temp_path = os.path.join(temp_dir, f"{safe_title}_{user_id}.mp4")
@@ -492,11 +525,11 @@ def handle_download_callback(callback_query: dict):
             # Execute handshake
             session = get_mapple_session()
             edit_message(chat_id, progress_msg_id, "🔐 Handshaking with server...", reply_markup=build_download_progress_keyboard())
-            
+
             stream_url = execute_handshake(session, item_id, media_type)
-            
+
             edit_message(chat_id, progress_msg_id, "📥 Starting download...", reply_markup=build_download_progress_keyboard())
-            
+
             # Get title from cached result
             cached = search_cache.get(user_id, [])
             title = "Video"
@@ -504,30 +537,30 @@ def handle_download_callback(callback_query: dict):
                 if item.get("id") == item_id and item.get("media_type") == media_type:
                     title = item.get("title") or item.get("name") or "Video"
                     break
-            
+
             # Download
             temp_path = download_stream(chat_id, user_id, stream_url, title, progress_msg_id)
-            
+
             if temp_path and os.path.exists(temp_path):
                 file_size = os.path.getsize(temp_path)
-                
+
                 # Send video
                 edit_message(chat_id, progress_msg_id, f"📤 Sending video ({file_size / 1024 / 1024:.1f} MB)...")
-                
+
                 keyboard = {"inline_keyboard": [[{"text": "🔍 New Search", "callback_data": "search_again"}]]}
-                
+
                 result = send_video(chat_id, temp_path, caption=f"🎬 {title}", reply_markup=keyboard)
-                
+
                 if not result:
                     # Try as document
                     send_document(chat_id, temp_path, caption=f"🎬 {title}")
-                
+
                 # Cleanup
                 try:
                     os.remove(temp_path)
                 except:
                     pass
-                
+
                 edit_message(chat_id, progress_msg_id, f"✅ <b>Done!</b> {title} sent successfully!", reply_markup=keyboard)
             else:
                 edit_message(chat_id, progress_msg_id, "❌ Download failed - file not created", reply_markup={"inline_keyboard": [[{"text": "🔍 New Search", "callback_data": "search_again"}]]})
@@ -669,21 +702,6 @@ def handle_inline_query(inline_query: dict):
         json={"inline_query_id": query_id, "results": inline_results, "cache_time": 300}, timeout=10)
 
 
-def send_photo(chat_id: int, photo_url: str, caption: str = None, reply_markup=None):
-    url = f"{TELEGRAM_API}/sendPhoto"
-    payload = {"chat_id": chat_id, "photo": photo_url}
-    if caption:
-        payload["caption"] = caption
-        payload["parse_mode"] = "HTML"
-    if reply_markup:
-        import json
-        payload["reply_markup"] = json.dumps(reply_markup)
-    try:
-        requests.post(url, json=payload, timeout=10)
-    except:
-        pass
-
-
 # ======================================================================
 # FLASK WEBHOOK
 # ======================================================================
@@ -718,10 +736,11 @@ def health():
 try:
     requests.post(f"{TELEGRAM_API}/deleteWebhook", timeout=10)
     resp = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL}, timeout=10)
-    logger.info(f"Webhook set: {resp.status_code}")
+    logger.info(f"Webhook set: {resp.status_code} - {resp.text}")
 except Exception as e:
     logger.error(f"Webhook setup error: {e}")
 
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 7860))
     app.run(host="0.0.0.0", port=port)
