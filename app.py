@@ -77,8 +77,8 @@ _telegram_session.mount("https://", _adapter)
 _telegram_session.mount("http://", _adapter)
 
 def _telegram_request(method: str, endpoint: str, **kwargs):
-    """Make Telegram API request with retry and 60s timeout"""
-    timeout = kwargs.pop('timeout', 60)
+    """Make Telegram API request with retry and 90s timeout"""
+    timeout = kwargs.pop('timeout', 90)
     url = f"{TELEGRAM_API}/{endpoint}"
     try:
         return _telegram_session.request(method, url, timeout=timeout, **kwargs)
@@ -665,18 +665,23 @@ def handle_inline_query(inline_query: dict):
 
 
 def setup_webhook():
-    """Lazy webhook setup - called on first request"""
+    """Lazy webhook setup - called on first request (non-blocking)"""
     global _webhook_initialized
     with _webhook_lock:
         if _webhook_initialized:
             return
+        _webhook_initialized = True  # Mark immediately to prevent duplicate calls
+    
+    def _do_setup():
         try:
-            _telegram_request("POST", "deleteWebhook", timeout=20)
-            resp = _telegram_request("POST", "setWebhook", json={"url": WEBHOOK_URL}, timeout=20)
+            _telegram_request("POST", "deleteWebhook", timeout=60)
+            resp = _telegram_request("POST", "setWebhook", json={"url": WEBHOOK_URL}, timeout=60)
             logger.info(f"Webhook set: {resp.status_code} - {resp.text}")
         except Exception as e:
             logger.error(f"Webhook setup error: {e}")
-        _webhook_initialized = True
+    
+    # Run in background thread - don't block the request
+    threading.Thread(target=_do_setup, daemon=True).start()
 
 
 # ======================================================================
@@ -689,17 +694,23 @@ def webhook():
 
     if request.headers.get("content-type") == "application/json":
         update = request.get_json()
-        try:
-            if "message" in update:
-                handle_message(update["message"])
-            elif "callback_query" in update:
-                handle_callback_query(update["callback_query"])
-            elif "inline_query" in update:
-                handle_inline_query(update["inline_query"])
-        except Exception as e:
-            logger.error(f"Error: {e}\n{traceback.format_exc()}")
+        # Process in background thread so we return "OK" immediately
+        threading.Thread(target=process_update, args=(update,), daemon=True).start()
         return "OK", 200
     abort(403)
+
+
+def process_update(update: dict):
+    """Process update in background thread"""
+    try:
+        if "message" in update:
+            handle_message(update["message"])
+        elif "callback_query" in update:
+            handle_callback_query(update["callback_query"])
+        elif "inline_query" in update:
+            handle_inline_query(update["inline_query"])
+    except Exception as e:
+        logger.error(f"Error: {e}\n{traceback.format_exc()}")
 
 
 @app.route("/")
