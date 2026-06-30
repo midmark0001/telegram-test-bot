@@ -34,6 +34,14 @@ WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}"
 logger.info(f"Webhook path: {WEBHOOK_PATH}")
 logger.info(f"Webhook URL: {WEBHOOK_URL}")
 
+# Set webhook at module level (runs when gunicorn imports the app)
+try:
+    bot.remove_webhook()
+    result = bot.set_webhook(url=WEBHOOK_URL)
+    logger.info(f"Webhook set at module load: {result}")
+except Exception as e:
+    logger.error(f"Error setting webhook at module load: {e}\n{traceback.format_exc()}")
+
 search_cache = {}
 
 
@@ -321,14 +329,8 @@ def webhook():
 
 @app.route("/")
 def set_webhook():
-    logger.info("Setting webhook...")
-    try:
-        bot.remove_webhook()
-        result = bot.set_webhook(url=WEBHOOK_URL)
-        logger.info(f"Webhook set: {result}")
-    except Exception as e:
-        logger.error(f"Error setting webhook: {e}\n{traceback.format_exc()}")
-    return f"Webhook set to {WEBHOOK_URL}", 200
+    logger.info("Root endpoint accessed - webhook already set at module load")
+    return f"Webhook is set to {WEBHOOK_URL}", 200
 
 
 @app.route("/health")
@@ -337,7 +339,5 @@ def health():
 
 
 if __name__ == "__main__":
-    bot.remove_webhook()
-    bot.set_webhook(url=WEBHOOK_URL)
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
