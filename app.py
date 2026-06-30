@@ -4,6 +4,15 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Create retry strategy for SSL/connection errors on HF Spaces
+_retry_strategy = Retry(
+    total=5,
+    backoff_factor=2,
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],
+    raise_on_status=False,
+)
+
 # Store original request method
 _original_request = requests.Session.request
 
@@ -22,6 +31,18 @@ def _patched_request(self, method, url, **kwargs):
     return _original_request(self, method, url, **kwargs)
 
 requests.Session.request = _patched_request
+
+# Patch Session to auto-mount retry adapter for HTTPS
+_original_session_init = requests.Session.__init__
+
+def _patched_session_init(self, *args, **kwargs):
+    _original_session_init(self, *args, **kwargs)
+    # Mount retry adapter for HTTPS (handles SSL EOF, connection resets)
+    adapter = HTTPAdapter(max_retries=_retry_strategy, pool_connections=50, pool_maxsize=50)
+    self.mount("https://", adapter)
+    self.mount("http://", adapter)
+
+requests.Session.__init__ = _patched_session_init
 
 # Now import everything else
 import os
