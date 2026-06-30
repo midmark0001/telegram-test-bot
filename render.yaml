@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegram-test-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn --timeout 120 --bind 0.0.0.0:10000 app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: BOT_TOKEN
+        sync: false
+      - key: RENDER_URL
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true
