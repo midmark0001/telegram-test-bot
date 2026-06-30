@@ -122,7 +122,7 @@ def send_message(chat_id: int, text: str, reply_markup=None, parse_mode="HTML"):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -136,7 +136,7 @@ def edit_message(chat_id: int, message_id: int, text: str, reply_markup=None, pa
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
-        resp = requests.post(url, json=payload, timeout=10)
+        resp = requests.post(url, json=payload)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -147,7 +147,7 @@ def edit_message(chat_id: int, message_id: int, text: str, reply_markup=None, pa
 def delete_message(chat_id: int, message_id: int):
     url = f"{TELEGRAM_API}/deleteMessage"
     try:
-        requests.post(url, json={"chat_id": chat_id, "message_id": message_id}, timeout=10)
+        requests.post(url, json={"chat_id": chat_id, "message_id": message_id})
     except:
         pass
 
@@ -158,7 +158,7 @@ def answer_callback_query(callback_query_id: str, text: str = None):
     if text:
         payload["text"] = text
     try:
-        requests.post(url, json=payload, timeout=10)
+        requests.post(url, json=payload)
     except:
         pass
 
@@ -212,7 +212,7 @@ def send_photo(chat_id: int, photo_url: str, caption: str = None, reply_markup=N
         import json
         payload["reply_markup"] = json.dumps(reply_markup)
     try:
-        requests.post(url, json=payload, timeout=10)
+        requests.post(url, json=payload)
     except:
         pass
 
@@ -255,7 +255,7 @@ def tmdb_search(query: str, page: int = 1):
     url = f"{TMDB_BASE_URL}/search/multi"
     params = {"api_key": TMDB_API_KEY, "query": query, "page": page, "include_adult": "false", "language": "en-US"}
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
         return [r for r in data.get("results", []) if r.get("media_type") in ("movie", "tv")][:10]
@@ -267,7 +267,7 @@ def tmdb_get_details(media_type: str, item_id: int):
     url = f"{TMDB_BASE_URL}/{media_type}/{item_id}"
     params = {"api_key": TMDB_API_KEY, "append_to_response": "credits,videos,images", "language": "en-US"}
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params)
         resp.raise_for_status()
         return resp.json()
     except:
@@ -322,7 +322,7 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
     """Execute the mapple.rip handshake to get stream URL"""
     # Step 1: Get requestToken from watch page
     watch_url = MAPPLE_WATCH_URL.format(media_type=media_type, item_id=item_id)
-    page_res = session.get(watch_url, timeout=10)
+    page_res = session.get(watch_url)
 
     import re
     token_match = re.search(r'"requestToken"\s*:\s*"([^"]+)"', page_res.text)
@@ -330,7 +330,7 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
 
     # Step 2: Initial playback init
     init_payload = {"mediaId": item_id, "mediaType": media_type, "requestToken": request_token}
-    res1 = session.post(MAPPLE_PLAYBACK_INIT, json=init_payload, timeout=10)
+    res1 = session.post(MAPPLE_PLAYBACK_INIT, json=init_payload)
     data1 = res1.json()
 
     # Step 3: PoW if required
@@ -341,7 +341,7 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
             **init_payload,
             "pow": {"challengeId": pow_meta["challengeId"], "nonce": resolved_nonce}
         }
-        res2 = session.post(MAPPLE_PLAYBACK_INIT, json=verification_payload, timeout=10)
+        res2 = session.post(MAPPLE_PLAYBACK_INIT, json=verification_payload)
         data2 = res2.json()
     else:
         data2 = data1
@@ -361,7 +361,7 @@ def execute_handshake(session: requests.Session, item_id: int, media_type: str):
         "requestToken": request_token,
         "token": final_playback_token
     }
-    res3 = session.get(MAPPLE_STREAM_API, params=stream_params, timeout=10)
+    res3 = session.get(MAPPLE_STREAM_API, params=stream_params)
     data3 = res3.json()
 
     if data3.get("success") and "data" in data3:
@@ -382,7 +382,7 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
 
     try:
         # Check if HLS
-        head_check = session.get(stream_url, timeout=10)
+        head_check = session.get(stream_url)
         manifest_content = head_check.text.strip()
 
         if manifest_content.startswith("#EXTM3U"):
@@ -397,7 +397,7 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
                         variant_playlist_url = urljoin(stream_url, next_line)
                         break
 
-            variant_res = session.get(variant_playlist_url, timeout=10)
+            variant_res = session.get(variant_playlist_url)
             segment_urls = []
             for line in variant_res.text.splitlines():
                 cleaned = line.strip()
@@ -417,7 +417,7 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
                 if download_sessions.get(user_id, {}).get("cancel"):
                     return None
                 try:
-                    r = session.get(chunk_url, timeout=10)
+                    r = session.get(chunk_url)
                     if r.status_code == 200:
                         return chunk_index, r.content
                 except:
@@ -466,7 +466,7 @@ def download_stream(chat_id: int, user_id: int, stream_url: str, title: str, pro
 
         else:
             # Direct MP4
-            with session.get(stream_url, stream=True, timeout=30) as response:
+            with session.get(stream_url, stream=True) as response:
                 if response.status_code != 200:
                     raise Exception("Server connection dropped")
                 total_bytes = int(response.headers.get('content-length', 0))
@@ -707,7 +707,7 @@ def handle_inline_query(inline_query: dict):
         inline_results.append(r)
 
     requests.post(f"{TELEGRAM_API}/answerInlineQuery",
-        json={"inline_query_id": query_id, "results": inline_results, "cache_time": 300}, timeout=10)
+        json={"inline_query_id": query_id, "results": inline_results, "cache_time": 300})
 
 
 # ======================================================================
@@ -742,8 +742,8 @@ def health():
 
 # Set webhook at module load
 try:
-    requests.post(f"{TELEGRAM_API}/deleteWebhook", timeout=10)
-    resp = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL}, timeout=10)
+    requests.post(f"{TELEGRAM_API}/deleteWebhook")
+    resp = requests.post(f"{TELEGRAM_API}/setWebhook", json={"url": WEBHOOK_URL})
     logger.info(f"Webhook set: {resp.status_code} - {resp.text}")
 except Exception as e:
     logger.error(f"Webhook setup error: {e}")
