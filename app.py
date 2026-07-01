@@ -73,8 +73,6 @@ _retry_strategy = Retry(
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"],
     raise_on_status=False,
-    # Also retry on these exception types
-    retry_mode=None,
 )
 _adapter = HTTPAdapter(max_retries=_retry_strategy, pool_connections=20, pool_maxsize=20)
 _telegram_session.mount("https://", _adapter)
