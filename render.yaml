@@ -1,17 +1,15 @@
 services:
   - type: web
-    name: telegram-test-bot
+    name: telegram-movie-bot-render
     env: python
     region: oregon
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --timeout 120 --bind 0.0.0.0:10000 app:app
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn --timeout 120 --bind 0.0.0.0:10000 render_bot:app"
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
       - key: BOT_TOKEN
         sync: false
-      - key: RENDER_URL
-        sync: false
-    healthCheckPath: /health
-    autoDeploy: true
+      - key: HF_API_URL
+        value: https://mandyg8-telegram-movie-bot.hf.space
+      - key: RENDER_EXTERNAL_HOSTNAME
+        value: telegram-test-bot-2-impw.onrender.com
